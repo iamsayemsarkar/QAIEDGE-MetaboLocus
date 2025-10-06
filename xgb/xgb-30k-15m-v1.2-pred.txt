@@ -1,0 +1,296 @@
+# ==============================================================================
+# STEP 1: INSTALL REQUIRED LIBRARIES
+# ==============================================================================
+# PyArrow is used for the high-performance Parquet file format.
+# TQDM is used for progress monitoring.
+!pip install pandas numpy torch transformers scikit-learn rdkit xgboost pyarrow tqdm --quiet
+print("Dependencies installed.")
+
+# ==============================================================================
+# STEP 2: DEFINE AND CREATE THE PREDICTION SCRIPT
+# ==============================================================================
+# This script is engineered for performance and scalability.
+# - Implements updated, more accurate verification thresholds.
+# - Utilizes batch processing for significant performance improvement.
+# - Centralizes verification thresholds in a configuration dictionary for maintainability.
+script_content = """
+import argparse
+import os
+import pickle
+import sys
+import warnings
+from typing import Any, Dict, List, Tuple
+
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import xgboost as xgb
+from rdkit import Chem, RDLogger
+from rdkit.Chem import AllChem, Descriptors
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import MultiLabelBinarizer, StandardScaler
+from torch.utils.data import DataLoader, TensorDataset
+from tqdm import tqdm
+from transformers import AutoModel, AutoTokenizer
+
+# --- Environment Configuration ---
+warnings.filterwarnings("ignore", category=UserWarning)
+RDLogger.DisableLog('rdApp.*') # Suppress RDKit logging.
+
+# --- Global Constants & Configuration ---
+MODEL_PATH = '/content/drive/My Drive/hmdb/xgb-30k-15m-v1.2.pkl'
+CHEMBERTA_MODEL_NAME = 'seyonec/ChemBERTa-zinc-base-v1'
+FINGERPRINT_BITS = 2048
+BATCH_SIZE = 64 # Batch size for metabolite processing.
+
+# --- Verification Thresholds ---
+# Defines confidence tiers for classification.
+VERIFICATION_THRESHOLDS = {
+    'Definitive':      {'pred': 0.95, 'other': 0.05},
+    'Highly Reliable': {'pred': 0.90, 'other': 0.10},
+    'Probable':        {'pred': 0.75, 'other': 0.25}
+}
+
+# --- Feature Engineering ---
+# List of numerical features to be computed from RDKit molecular descriptors.
+COMPUTED_NUMERICAL_FEATURES = [
+    'MolWt', 'ExactMolWt', 'HeavyAtomCount', 'NumHAcceptors', 'NumHDonors',
+    'NumValenceElectrons', 'NumAromaticRings', 'NumAliphaticRings', 'RingCount',
+    'TPSA', 'MolLogP', 'MolMR', 'FractionCSP3', 'NumRotatableBonds', 'qed',
+    'HallKierAlpha', 'MaxPartialCharge', 'MinPartialCharge', 'BalabanJ',
+    'BertzCT', 'Chi0v', 'Kappa2', 'fr_NH2', 'fr_COO', 'fr_phenol',
+    'fr_aldehyde', 'fr_ketone', 'fr_ether',
+    'NumHDonors_vs_TPSA', 'MolLogP_vs_MolWt', 'RingCount_vs_HeavyAtomCount'
+]
+
+# --- Model Architectures ---
+# These class definitions are required for unpickling the saved model package.
+class XGBoostEnsembleWrapper:
+    def __init__(self, estimators: List[Any]): self.estimators_ = estimators
+    def predict_proba(self, X: np.ndarray) -> np.ndarray: return np.hstack([est.predict_proba(X)[:, 1].reshape(-1, 1) for est in self.estimators_])
+
+class MLPEmbeddingExpert(nn.Module):
+    def __init__(self, input_dim: int, num_classes: int):
+        super(MLPEmbeddingExpert, self).__init__()
+        self.network = nn.Sequential(
+            nn.Linear(input_dim, 512), nn.BatchNorm1d(512), nn.ReLU(), nn.Dropout(0.5),
+            nn.Linear(512, 256), nn.BatchNorm1d(256), nn.ReLU(), nn.Dropout(0.5),
+            nn.Linear(256, num_classes))
+    def forward(self, x: torch.Tensor) -> torch.Tensor: return self.network(x)
+
+class StackingMetaModel:
+    def __init__(self, models: List[Any]): self.models = models
+    def predict_proba(self, X: np.ndarray) -> np.ndarray: return np.hstack([model.predict_proba(X)[:, 1].reshape(-1, 1) for model in self.models])
+
+def load_model_package(path: str) -> Dict[str, Any]:
+    \"\"\"Loads the pickled model package from the specified path.\"\"\"
+    print(f"Loading model from {path}...")
+    if not os.path.exists(path):
+        print(f"Error: Model file not found at '{path}'", file=sys.stderr)
+        sys.exit(1)
+    try:
+        with open(path, 'rb') as f:
+            model_package = pickle.load(f)
+        print("Model loaded.")
+        return model_package
+    except Exception as e:
+        print(f"Error loading model pickle file: {e}", file=sys.stderr)
+        sys.exit(1)
+
+def compute_features_batch(smiles_batch: List[str], chemberta_tokenizer, chemberta_model, device, imputer, scaler) -> Tuple[np.ndarray, np.ndarray, List[int]]:
+    \"\"\"Computes RDKit and ChemBERTa features for a batch of SMILES strings.\"\"\"
+    rdkit_features, valid_smiles_for_chemberta, valid_indices = [], [], []
+    
+    # Process RDKit features serially for robust error handling per molecule.
+    for idx, smiles in enumerate(smiles_batch):
+        mol = Chem.MolFromSmiles(smiles)
+        if mol is None: continue
+        try:
+            Chem.rdPartialCharges.ComputeGasteigerCharges(mol)
+            fp = np.array(list(AllChem.GetMorganFingerprintAsBitVect(mol, 2, nBits=FINGERPRINT_BITS).ToBitString()), dtype=np.uint8)
+            desc = {k: func(mol) for k, func in Descriptors._descList}
+            
+            # Add custom interaction terms.
+            desc.update({
+                'NumHDonors_vs_TPSA': desc.get('NumHDonors', 0) / (desc.get('TPSA', 0) + 1e-6),
+                'MolLogP_vs_MolWt': desc.get('MolLogP', 0) / (desc.get('MolWt', 0) + 1e-6),
+                'RingCount_vs_HeavyAtomCount': desc.get('RingCount', 0) / (desc.get('HeavyAtomCount', 0) + 1e-6)
+            })
+            desc_df = pd.DataFrame([desc])[COMPUTED_NUMERICAL_FEATURES]
+            rdkit_features.append(np.concatenate([fp, scaler.transform(imputer.transform(desc_df))[0]]))
+            valid_smiles_for_chemberta.append(smiles)
+            valid_indices.append(idx)
+        except Exception:
+            continue
+    
+    if not valid_smiles_for_chemberta:
+        return None, None, []
+        
+    # Compute ChemBERTa embeddings in a single batch for performance.
+    with torch.no_grad():
+        inputs = chemberta_tokenizer(valid_smiles_for_chemberta, return_tensors='pt', padding=True, truncation=True, max_length=512).to(device)
+        embeddings = chemberta_model(**inputs).last_hidden_state[:, 0, :].cpu().numpy()
+        
+    return np.vstack(rdkit_features), embeddings, valid_indices
+
+def get_verification_status(scores: np.ndarray, indices: List[int], thresholds: Dict) -> str:
+    \"\"\"Assigns a verification tier based on configured thresholds.\"\"\"
+    if not indices: return "Indeterminate"
+    
+    predicted_scores = scores[indices]
+    other_indices = np.delete(np.arange(len(scores)), indices)
+    other_scores = scores[other_indices] if other_indices.size > 0 else np.array([0])
+    
+    th = thresholds # Alias for brevity.
+    if np.all(predicted_scores > th['Definitive']['pred']) and np.all(other_scores < th['Definitive']['other']): return "Definitive"
+    if np.all(predicted_scores > th['Highly Reliable']['pred']) and np.all(other_scores < th['Highly Reliable']['other']): return "Highly Reliable"
+    if np.all(predicted_scores > th['Probable']['pred']) and np.all(other_scores < th['Probable']['other']): return "Probable"
+    return "Indeterminate"
+
+def main():
+    parser = argparse.ArgumentParser(description="Predict metabolite biofluid distribution from SMILES strings using a pre-trained stacked ensemble model.")
+    parser.add_argument("input_file", help="Path to a TXT file containing one SMILES string per line.")
+    parser.add_argument("--model_path", default=MODEL_PATH, help="Path to the trained model file.")
+    parser.add_argument('--formats', nargs='+', default=['csv', 'parquet'], help="Output file formats. Choose from 'csv', 'parquet'.")
+    args = parser.parse_args()
+
+    model_package = load_model_package(args.model_path)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using compute device: {device}")
+
+    xgb_expert_model = model_package['xgb_expert']
+    meta_model = model_package['meta_model']
+    binarizer = model_package['binarizer']
+    imputer = model_package['rdkit_imputer']
+    scaler = model_package['rdkit_scaler']
+    optimal_threshold = model_package['optimal_threshold']
+
+    print(f"Loading ChemBERTa model: '{CHEMBERTA_MODEL_NAME}'...")
+    chemberta_tokenizer = AutoTokenizer.from_pretrained(CHEMBERTA_MODEL_NAME)
+    chemberta_model = AutoModel.from_pretrained(CHEMBERTA_MODEL_NAME).to(device)
+    chemberta_model.eval()
+
+    mlp_expert_model = MLPEmbeddingExpert(chemberta_model.config.hidden_size, len(binarizer.classes_)).to(device)
+    mlp_expert_model.load_state_dict(model_package['mlp_expert_state_dict'])
+    mlp_expert_model.eval()
+
+    try:
+        with open(args.input_file, 'r', encoding='utf-8') as f:
+            smiles_list = [line.strip() for line in f if line.strip()]
+        print(f"Loaded {len(smiles_list)} SMILES strings from '{args.input_file}'.")
+    except FileNotFoundError:
+        print(f"Error: Input file not found at '{args.input_file}'", file=sys.stderr)
+        sys.exit(1)
+
+    results, invalid_smiles_count = [], 0
+    print(f"Processing metabolites in batches of {BATCH_SIZE}...")
+    
+    for i in tqdm(range(0, len(smiles_list), BATCH_SIZE), unit="batch"):
+        smiles_batch = smiles_list[i:i + BATCH_SIZE]
+        X_rdkit_batch, X_embed_batch, valid_indices = compute_features_batch(smiles_batch, chemberta_tokenizer, chemberta_model, device, imputer, scaler)
+
+        if valid_indices:
+            xgb_preds = xgb_expert_model.predict_proba(X_rdkit_batch)
+            with torch.no_grad():
+                mlp_preds = torch.sigmoid(mlp_expert_model(torch.FloatTensor(X_embed_batch).to(device))).cpu().numpy()
+            
+            X_meta_batch = np.concatenate([xgb_preds, mlp_preds], axis=1)
+            confidence_scores_batch = meta_model.predict_proba(X_meta_batch)
+
+            for j, original_batch_idx in enumerate(valid_indices):
+                global_idx = i + original_batch_idx
+                confidence_scores = confidence_scores_batch[j]
+                pred_indices = list(np.where(confidence_scores >= optimal_threshold)[0])
+                pred_class = " + ".join(binarizer.classes_[pred_indices]) if pred_indices else "None"
+                confidence_profile = ", ".join([f"{cls}: {score:.2%}" for cls, score in zip(binarizer.classes_, confidence_scores)])
+                verification_status = get_verification_status(confidence_scores, pred_indices, VERIFICATION_THRESHOLDS)
+                results.append({
+                    "ID": global_idx + 1, "SMILES": smiles_batch[original_batch_idx], "Predicted_Class": pred_class,
+                    "Confidence_Profile": confidence_profile, "Verification_Status": verification_status
+                })
+        
+        invalid_smiles_count += len(smiles_batch) - len(valid_indices)
+
+    if not results:
+        print("\\nNo valid metabolites were processed. No output files generated.")
+        return
+
+    df_results = pd.DataFrame(results)
+    output_dir = os.path.dirname(args.input_file)
+    base_name = os.path.splitext(os.path.basename(args.input_file))[0]
+    
+    if 'csv' in args.formats:
+        csv_path = os.path.join(output_dir, f"{base_name}_predictions.csv")
+        df_results.to_csv(csv_path, index=False, encoding='utf-8')
+        print(f"\\nDetailed predictions saved to: {csv_path}")
+
+    if 'parquet' in args.formats:
+        parquet_path = os.path.join(output_dir, f"{base_name}_predictions.parquet")
+        df_results.to_parquet(parquet_path, index=False)
+        print(f"High-performance predictions saved to: {parquet_path}")
+
+    global_summary = df_results['Verification_Status'].value_counts().reset_index()
+    global_summary.columns = ['Verification_Status', 'Count']
+    global_summary['Percentage'] = ((global_summary['Count'] / len(df_results)) * 100).map('{:.2f}%'.format)
+
+    per_class_summary = []
+    for biofluid in binarizer.classes_:
+        class_rows = df_results[df_results['Predicted_Class'].str.contains(biofluid.replace("(", "\\\\(").replace(")", "\\\\)"), na=False, regex=True)]
+        summary = class_rows['Verification_Status'].value_counts().reindex(['Definitive', 'Highly Reliable', 'Probable', 'Indeterminate'], fill_value=0)
+        per_class_summary.append({
+            'Biofluid_Class': biofluid, 'Definitive': summary['Definitive'], 'Highly_Reliable': summary['Highly Reliable'],
+            'Probable': summary['Probable'], 'Indeterminate': summary['Indeterminate'], 'Total': len(class_rows)
+        })
+    df_per_class = pd.DataFrame(per_class_summary)
+
+    summary_path = os.path.join(output_dir, f"{base_name}_summary_report.md")
+    with open(summary_path, 'w', encoding='utf-8') as f:
+        f.write("# Prediction Summary Report\\n\\n")
+        f.write(f"Processed **{len(smiles_list)}** total SMILES strings.\\n")
+        f.write(f"Successfully generated predictions for **{len(results)}** metabolites.\\n")
+        f.write(f"Skipped **{invalid_smiles_count}** invalid or unprocessable SMILES strings.\\n\\n")
+        f.write("## Global Verification Summary\\n\\n")
+        f.write(global_summary.to_markdown(index=False))
+        f.write("\\n\\n## Per-Class Verification Breakdown\\n\\n")
+        f.write(df_per_class.to_markdown(index=False))
+    print(f"Aggregate analysis report saved to: {summary_path}")
+
+    print("\\n--- Aggregate Analysis (Console Summary) ---")
+    print("Global Verification Summary:")
+    print(global_summary.to_markdown(index=False))
+    print("\\nPer-Class Verification Breakdown:")
+    print(df_per_class.to_markdown(index=False))
+
+if __name__ == "__main__":
+    main()
+"""
+
+with open("predict.py", "w") as f:
+    f.write(script_content)
+print("Prediction script 'predict.py' created.")
+
+# ==============================================================================
+# STEP 3: MOUNT GOOGLE DRIVE
+# ==============================================================================
+import os
+from google.colab import drive
+drive.mount('/content/drive', force_remount=True)
+print("Google Drive mounted.")
+
+# ==============================================================================
+# STEP 4: EXECUTE THE PREDICTION SCRIPT
+# ==============================================================================
+# All enhancements are internal to the script, resulting in faster execution.
+print("\nStarting prediction workflow...")
+input_smiles_file = "/content/drive/My Drive/hmdb/hmdb_uncharacterized_metabolites_for_annotation_171456.txt"
+model_file = "/content/drive/My Drive/hmdb/xgb-30k-15m-v1.2.pkl"
+
+if not os.path.exists(model_file):
+    print(f"\nCRITICAL ERROR: The model file was not found at '{model_file}'")
+elif not os.path.exists(input_smiles_file):
+    print(f"\nCRITICAL ERROR: The input SMILES file was not found at '{input_smiles_file}'")
+else:
+    !python predict.py "{input_smiles_file}" --model_path "{model_file}"
+    print("\n\nWorkflow complete.")
+    print("Output files are located in your Google Drive folder: '/content/drive/My Drive/hmdb/'.")
