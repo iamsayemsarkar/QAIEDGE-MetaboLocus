@@ -150,11 +150,8 @@ ROC AUC (Micro)	0.9967
 For a detailed breakdown of class-wise performance and feature importance, please refer to the thesis/publication associated with this work.
 
 📁 Repository Structure
-code
-Code
-download
-content_copy
-expand_less
+
+
 QAIEDGE-MetaboLocus/
 │
 ├── data/
@@ -185,11 +182,7 @@ QAIEDGE-MetaboLocus/
 
 If you use MetaboLocus in your research, please cite the following work:
 
-code
-Bibtex
-download
-content_copy
-expand_less
+
 @phdthesis{YourName2025MetaboLocus,
   author       = {[Your Name]},
   title        = {A Machine Learning Framework for Predicting Metabolite Biofluid Distribution from Chemical Structure},
