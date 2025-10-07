@@ -1,0 +1,23 @@
+# Data handling
+numpy>=1.24.0
+pandas>=2.1.0
+
+# Machine Learning
+scikit-learn>=1.2.0
+xgboost>=1.7.5
+optuna>=3.2.0
+
+# Deep Learning
+torch>=2.1.0
+torchvision>=0.16.0
+torchaudio>=2.1.0
+
+# Transformers for ChemBERTa
+transformers>=4.40.0
+
+# Chemistry & feature computation
+rdkit-pypi>=2023.9.1
+
+# Utilities
+tqdm>=4.65.0
+lxml>=4.9.3
