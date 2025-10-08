@@ -136,7 +136,9 @@ python scripts/xgb/xgb-30k-15m-v1.2-pred.txt --input_file my_metabolites.txt --o
 ```bibtex
 @mastersthesis{Sarkar2025MetaboLocus,
   author       = {Sayem Sarkar},
-  title        = {Machine Learning–Driven Prediction of Metabolite Localization in Human Biofluids from Molecular Structures Using the Human Metabolome Database},
+  title        = {Machine Learning Based Identification of Metabolite Localization
+in Human Biofluids from Molecular Structures Using the Human
+Metabolome Database},
   school       = {Jahangirnagar University},
   year         = {2025},
   month        = {October},
