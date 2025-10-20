@@ -167,10 +167,12 @@ This project is licensed under the MIT License. See the [LICENSE](LICENSE) file 
 
 ---
 
-## 🙏 Acknowledgements
+### 🙏 Acknowledgements
 
-I extend my deepest gratitude to my mentor, Dr. Abdullah Mohammad Shohael, for his transformative guidance and for championing this ambitious research. His leadership at our laboratory, the Cell Genetics and Plant Biotechnology Laboratory (CGPBL), created an environment where venturing beyond traditional boundaries was not just possible, but encouraged.
+I extend my deepest gratitude to my mentor, **Dr. Abdullah Mohammad Shohael**, for his **transformative guidance** and for championing this ambitious research. His leadership at **our laboratory**, the **Cell Genetics and Plant Biotechnology Laboratory (CGPBL)**, created an environment where venturing **beyond traditional boundaries** was not just possible, but actively encouraged.
 
-This work was conducted at my intellectual home, the CGPBL, and I am profoundly grateful for the stimulating and collaborative culture that was essential to this project's success. My thanks also extend to the Department of Biotechnology and Genetic Engineering at Jahangirnagar University for providing the foundational academic training that made this research possible.
+This work was conducted at my **intellectual home**, the CGPBL, and I am profoundly grateful for the stimulating and collaborative culture that was **essential to this project's success**. My thanks also extend to the Department of Biotechnology and Genetic Engineering at Jahangirnagar University for providing the foundational academic training that made this research possible.
 
-I am proud to be part of the pioneering work we do at the CGPBL. To explore more of our research, please visit us at https://cgpbl.ac.bd/.
+I am proud to be part of the **pioneering work** we do at the CGPBL. To explore more of our research, please visit us at [https://cgpbl.ac.bd/](https://cgpbl.ac.bd/).
+
+---
