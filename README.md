@@ -149,7 +149,7 @@ Metabolome Database},
 
 ## 👨‍💻 About the Developer
 
-This research was conducted and developed by Sayem Sarkar. To learn more about his work and other projects, please visit his professional website:
+This research was conducted and developed by Sayem Sarkar. To learn more about his work and other projects, please visit his startup website:
 
 **[https://qaiedge.com/](https://qaiedge.com/)**
 
